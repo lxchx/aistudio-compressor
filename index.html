@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8" />
+    <title>AI Studio Compressor 设置</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        :root {
+            /* 配色方案 - Slate & Indigo */
+            --primary: #4f46e5;
+            --primary-hover: #4338ca;
+            --danger: #ef4444;
+            --danger-hover: #dc2626;
+            --surface: #ffffff;
+            --bg: #f8fafc;
+            --border: #e2e8f0;
+            --text-main: #1e293b;
+            --text-sub: #64748b;
+            --input-bg: #f1f5f9;
+            --code-font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            --radius: 12px;
+            --shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            background: var(--bg);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: var(--text-main);
+            line-height: 1.5;
+            padding-bottom: 40px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        /* 头部样式 */
+        header {
+            margin-bottom: 32px;
+            text-align: center;
+        }
+        header h1 {
+            font-size: 28px;
+            font-weight: 700;
+            margin: 0 0 8px;
+            background: linear-gradient(135deg, #4f46e5, #818cf8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        header p {
+            color: var(--text-sub);
+            font-size: 14px;
+            margin: 0;
+        }
+
+        /* 卡片通用样式 */
+        .card {
+            background: var(--surface);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            padding: 24px;
+            margin-bottom: 24px;
+            border: 1px solid var(--border);
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: var(--text-main);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .card-title svg { width: 20px; height: 20px; color: var(--text-sub); }
+
+        /* 表单控件 */
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: var(--text-main);
+        }
+        
+        .description {
+            font-size: 13px;
+            color: var(--text-sub);
+            margin-bottom: 12px;
+            margin-top: -4px;
+        }
+
+        textarea, input[type="text"], input[type="number"] {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--surface);
+            font-size: 14px;
+            transition: all 0.2s;
+            color: var(--text-main);
+        }
+
+        textarea:focus, input:focus {
+            outline: none;
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+        }
+
+        /* 特定输入框样式 */
+        textarea.code-editor {
+            font-family: var(--code-font);
+            font-size: 13px;
+            line-height: 1.6;
+            min-height: 220px;
+            background: #fafafa;
+            white-space: pre;
+            overflow-wrap: normal;
+            overflow-x: auto;
+        }
+
+        input.code-line {
+            font-family: var(--code-font);
+            background: #fafafa;
+        }
+
+        /* 记忆保留设置区域 */
+        .memory-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            background: var(--input-bg);
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+        
+        .math-explainer {
+            grid-column: 1 / -1;
+            font-size: 12px;
+            color: var(--text-sub);
+            background: rgba(255,255,255,0.5);
+            padding: 8px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border: 1px dashed var(--border);
+        }
+        .math-explainer strong { color: var(--primary); }
+
+        /* 按钮样式 */
+        .actions-bar {
+            position: sticky;
+            bottom: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(10px);
+            padding: 16px 24px;
+            border-radius: 16px;
+            box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.1);
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            border: 1px solid var(--border);
+            margin-top: 20px;
+        }
+
+        button {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            padding: 10px 18px;
+            border-radius: 8px;
+            border: 1px solid transparent;
+            font-weight: 500;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        button.primary {
+            background: var(--primary);
+            color: white;
+            box-shadow: 0 2px 5px rgba(79, 70, 229, 0.3);
+        }
+        button.primary:hover { background: var(--primary-hover); transform: translateY(-1px); }
+
+        button.secondary {
+            background: white;
+            border-color: var(--border);
+            color: var(--text-main);
+        }
+        button.secondary:hover { background: var(--input-bg); border-color: #cbd5e1; }
+
+        button.danger {
+            background: white;
+            border-color: #fecaca;
+            color: var(--danger);
+        }
+        button.danger:hover { background: #fef2f2; border-color: #fca5a5; }
+
+        button.small {
+            padding: 6px 12px;
+            font-size: 12px;
+            height: 32px;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none !important;
+        }
+
+        /* Toast 提示 */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            pointer-events: none;
+        }
+        .toast {
+            background: #1e293b;
+            color: white;
+            padding: 10px 20px;
+            border-radius: 50px;
+            font-size: 14px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            opacity: 0;
+            transform: translateY(-20px);
+            transition: all 0.3s cubic-bezier(0.68, -0.55, 0.27, 1.55);
+        }
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        @media (max-width: 600px) {
+            .memory-grid { grid-template-columns: 1fr; }
+            .actions-bar { flex-direction: column-reverse; bottom: 0; border-radius: 0; }
+            .actions-bar button { width: 100%; }
+        }
+    </style>
+</head>
+<body>
+    <div class="toast-container">
+        <div id="toast" class="toast">设置已保存</div>
+    </div>
+
+    <div class="container">
+        <header>
+            <h1>Compressor 控制台</h1>
+            <p>自定义 AI Studio 历史记录压缩逻辑与记忆保留策略</p>
+        </header>
+
+        <form id="compressor-settings-form">
+            <!-- Prompt 设置卡片 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">
+                        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                        </svg>
+                        压缩指令 (System Prompt)
+                    </span>
+                    <div style="display:flex; gap:8px;">
+                        <button type="button" class="secondary small" id="btn-copy-prompt" title="复制当前内容">复制</button>
+                        <button type="button" class="secondary small" id="btn-prompt-reset" title="重置为初始默认 Prompt">恢复默认</button>
+                    </div>
+                </div>
+                <div class="description">
+                    这是发送给 AI 的核心指令。定义了 XML 输出结构 `<state_snapshot>` 及其包含的字段。
+                </div>
+                <textarea id="field-prompt" name="compressPrompt" class="code-editor" spellcheck="false"></textarea>
+            </div>
+
+            <!-- 正则匹配卡片 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">
+                        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+                        </svg>
+                        结果提取正则 (Regex)
+                    </span>
+                </div>
+                <div class="description">
+                    用于从 AI 回复中精准提取 XML 内容。若留空则尝试提取整个回复。
+                </div>
+                <input id="field-regex" class="code-line" name="snapshotRegex" type="text" placeholder="<state_snapshot>[\s\S]*?</state_snapshot>" />
+            </div>
+
+            <!-- 历史记录策略卡片 -->
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title">
+                        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        历史消息裁剪策略
+                    </span>
+                </div>
+                <div class="memory-grid">
+                    <div class="math-explainer">
+                        <span>💡 计算逻辑：保留字数 = MAX ( <strong>总字数 × 百分比</strong> , <strong>最少保留字数</strong> )</span>
+                    </div>
+                    <div>
+                        <label>保留尾部百分比 (%)</label>
+                        <input id="field-percent" name="tailPercent" type="number" min="0" max="100" step="1" />
+                        <div class="description" style="margin-top:6px; font-size:12px;">建议 20-50 之间</div>
+                    </div>
+                    <div>
+                        <label>最少保留字符数 (Chars)</label>
+                        <input id="field-minchars" name="tailMinChars" type="number" min="0" step="100" />
+                        <div class="description" style="margin-top:6px; font-size:12px;">防止短对话被过度压缩</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 底部操作栏 -->
+            <div class="actions-bar">
+                <div style="margin-right: auto;">
+                    <button type="button" class="danger" id="btn-reset">全部重置</button>
+                </div>
+                <button type="button" class="secondary" id="btn-close">关闭</button>
+                <button type="submit" class="primary">保存所有设置</button>
+            </div>
+        </form>
+    </div>
+
+    <script>
+        // --- Constants & Defaults ---
+        const DEFAULT_SETTINGS = {
+            compressPrompt: `That concludes the above topic. Please remember the chat history and switch roles:
+            
+  You are the component that summarizes internal chat history into a given structure.
+
+  When the conversation history grows too large, you will be invoked to distill the entire history into a concise, structured
+  XML snapshot. This snapshot is CRITICAL, as it will become the agent's *only* memory of the past. The agent will resume its
+  work based solely on this snapshot. All crucial details, plans, errors, and user directives MUST be preserved.
+
+  First, you will think through the entire history in a private <scratchpad>. Review the user's overall goal, the agent's
+  actions, tool outputs, file modifications, and any unresolved questions. Identify every piece of information that is essential
+  for future actions.
+
+  After your reasoning is complete, generate the final <state_snapshot> XML object. Be incredibly dense with information. Omit
+  any irrelevant conversational filler.
+
+  The structure MUST be as follows:
+
+  <state_snapshot>
+      <overall_goal>
+          <!-- A single, concise sentence describing the user's high-level objective. -->
+          <!-- Example: "Refactor the authentication service to use a new JWT library." -->
+      </overall_goal>
+
+      <key_knowledge>
+          <!-- Crucial facts, conventions, and constraints the agent must remember based on the conversation history and
+  interaction with the user. Use bullet points. -->
+          <!-- Example:
+           - Build Command: \`npm run build\`
+           - Testing: Tests are run with \`npm test\`. Test files must end in \`.test.ts\`.
+           - API Endpoint: The primary API endpoint is \`https://api.example.com/v2\`.
+
+          -->
+      </key_knowledge>
+
+      <file_system_state>
+          <!-- List files that have been created, read, modified, or deleted. Note their status and critical learnings. -->
+          <!-- Example:
+           - CWD: \`/home/user/project/src\`
+           - READ: \`package.json\` - Confirmed 'axios' is a dependency.
+           - MODIFIED: \`services/auth.ts\` - Replaced 'jsonwebtoken' with 'jose'.
+           - CREATED: \`tests/new-feature.test.ts\` - Initial test structure for the new feature.
+          -->
+      </file_system_state>
+
+      <recent_actions>
+          <!-- A summary of the last few significant agent actions and their outcomes. Focus on facts. -->
+          <!-- Example:
+           - Ran \`grep 'old_function'\` which returned 3 results in 2 files.
+           - Ran \`npm run test\`, which failed due to a snapshot mismatch in \`UserProfile.test.ts\`.
+           - Ran \`ls -F static/\` and discovered image assets are stored as \`.webp\`.
+          -->
+      </recent_actions>
+
+      <current_plan>
+          <!-- The agent's step-by-step plan. Mark completed steps. -->
+          <!-- Example:
+           1. [DONE] Identify all files using the deprecated 'UserAPI'.
+           2. [IN PROGRESS] Refactor \`src/components/UserProfile.tsx\` to use the new 'ProfileAPI'.
+           3. [TODO] Refactor the remaining files.
+           4. [TODO] Update tests to reflect the API change.
+          -->
+      </current_plan>
+  </state_snapshot>`,
+            snapshotRegex: "",
+            tailPercent: 30,
+            tailMinChars: 2000
+        };
+        const STORAGE_KEY = "aistudio_compressor_settings_preview";
+
+        // --- Elements ---
+        const form = document.getElementById("compressor-settings-form");
+        const promptField = document.getElementById("field-prompt");
+        const regexField = document.getElementById("field-regex");
+        const percentField = document.getElementById("field-percent");
+        const minCharsField = document.getElementById("field-minchars");
+        
+        const closeBtn = document.getElementById("btn-close");
+        const resetBtn = document.getElementById("btn-reset");
+        const promptResetBtn = document.getElementById("btn-prompt-reset");
+        const copyBtn = document.getElementById("btn-copy-prompt");
+        const toastEl = document.getElementById("toast");
+
+        // --- Utils ---
+        function showToast(message) {
+            toastEl.textContent = message;
+            toastEl.classList.add("show");
+            setTimeout(() => toastEl.classList.remove("show"), 2500);
+        }
+
+        function loadSettings() {
+            try {
+                const raw = localStorage.getItem(STORAGE_KEY);
+                if (!raw) return { ...DEFAULT_SETTINGS };
+                const parsed = JSON.parse(raw);
+                return { ...DEFAULT_SETTINGS, ...parsed };
+            } catch (err) {
+                console.warn("Failed to load preview settings", err);
+                return { ...DEFAULT_SETTINGS };
+            }
+        }
+
+        function saveSettings(settings) {
+            try {
+                localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+            } catch (err) {
+                console.warn("Failed to store preview settings", err);
+            }
+            if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({
+                    source: "aistudio-compressor",
+                    type: "update-settings",
+                    payload: settings
+                }, "*");
+            }
+        }
+
+        function populateForm(settings) {
+            promptField.value = settings.compressPrompt;
+            regexField.value = settings.snapshotRegex || "";
+            percentField.value = settings.tailPercent;
+            minCharsField.value = settings.tailMinChars;
+            updatePromptResetState();
+        }
+
+        function updatePromptResetState() {
+            const isDefault = promptField.value.trim() === DEFAULT_SETTINGS.compressPrompt.trim();
+            promptResetBtn.disabled = isDefault;
+            promptResetBtn.style.opacity = isDefault ? "0.5" : "1";
+        }
+
+        // --- Event Listeners ---
+
+        form.addEventListener("submit", event => {
+            event.preventDefault();
+            const parsedPercent = Number(percentField.value);
+            const normalizedPercent = Number.isFinite(parsedPercent) ? Math.min(Math.max(parsedPercent, 0), 100) : DEFAULT_SETTINGS.tailPercent;
+            const parsedMinChars = Number(minCharsField.value);
+            const normalizedMinChars = Number.isFinite(parsedMinChars) && parsedMinChars >= 0 ? Math.floor(parsedMinChars) : DEFAULT_SETTINGS.tailMinChars;
+            
+            const settings = {
+                compressPrompt: promptField.value.trim() || DEFAULT_SETTINGS.compressPrompt,
+                snapshotRegex: regexField.value.trim(),
+                tailPercent: normalizedPercent,
+                tailMinChars: normalizedMinChars
+            };
+            saveSettings(settings);
+            showToast("✅ 设置已保存");
+        });
+
+        promptField.addEventListener("input", updatePromptResetState);
+
+        promptResetBtn.addEventListener("click", () => {
+            promptField.value = DEFAULT_SETTINGS.compressPrompt;
+            updatePromptResetState();
+            showToast("🔄 Prompt 已恢复默认");
+        });
+
+        copyBtn.addEventListener("click", () => {
+            if (!promptField.value) return;
+            navigator.clipboard.writeText(promptField.value).then(() => {
+                showToast("📋 已复制到剪贴板");
+            }).catch(() => showToast("❌ 复制失败"));
+        });
+
+        resetBtn.addEventListener("click", () => {
+            if (!confirm("确定要将所有设置恢复为初始状态吗？此操作无法撤销。")) return;
+            saveSettings({ ...DEFAULT_SETTINGS });
+            populateForm(DEFAULT_SETTINGS);
+            showToast("♻️ 已恢复所有默认设置");
+        });
+
+        closeBtn.addEventListener("click", () => window.close());
+
+        window.addEventListener("message", event => {
+            if (!event.data || event.data.source !== "aistudio-compressor") return;
+            if (event.data.type === "hydrate" && event.data.payload) {
+                populateForm({ ...DEFAULT_SETTINGS, ...event.data.payload });
+                showToast("📥 已同步外部设置");
+            }
+        });
+
+        // --- Init ---
+        populateForm(loadSettings());
+    </script>
+</body>
+</html>

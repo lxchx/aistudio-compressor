@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Studio Chat Compressor
 // @namespace    https://lxchx.github.io/aistudio-compressor
-// @version      0.2
+// @version      0.3.2
 // @description  在 Google AI Studio 提供一键压缩聊天记录、注入快照、监控 GenerateContent 请求的工具，方便长对话续写与历史迁移 | Provides a one-click tool in Google AI Studio to compress chat history, inject snapshots, and monitor GenerateContent requests, facilitating long conversation continuation and history migration
 // @author       lxchx
 // @match        https://aistudio.google.com/prompts/*
@@ -26,8 +26,10 @@
         TARGETS: {
             GENERATE: "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/GenerateContent",
             RESOLVE: "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ResolveDriveResource",
-            LIST_PROMPTS: "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/ListPrompts",
             CREATE_PROMPT: "/$rpc/google.internal.alkali.applications.makersuite.v1.MakerSuiteService/CreatePrompt"
+        },
+        NETWORK: {
+            RPC_ORIGIN: "https://alkalimakersuite-pa.clients6.google.com"
         },
         EVENTS: {
             REQUEST: "aistudio-compressor:generatecontent-request",
@@ -35,7 +37,12 @@
         },
         UI: {
             BUTTON_ID: "compressor-button-hybrid",
-            TOOLBAR_SELECTOR: "ms-toolbar .toolbar-right",
+            TOOLBAR_SELECTORS: [
+                "ms-toolbar .toolbar-right",
+                "ms-playground-toolbar .toolbar-right",
+                "ms-playground-toolbar .toolbar-container .toolbar-right",
+                ".toolbar-right"
+            ],
             TARGET_PATH: "/prompts/",
             INPUT_SELECTORS: [
                 "ms-autosize-textarea textarea",
@@ -43,17 +50,17 @@
                 "textarea"
             ],
             SEND_BUTTON_SELECTORS: [
+                "ms-run-button button",
                 "ms-run-button button.run-button",
                 'button[aria-label="Run"]',
+                'button[aria-label^="Run"]',
+                'button[description*="Send prompt"]',
+                'button[aria-label*="keyboard_return"]',
                 'button[type="submit"]'
             ]
         },
         SETTINGS: {
             PAGE_URL: "https://lxchx.github.io/aistudio-compressor"
-        },
-        TIMING: {
-            BRANCH_MENU_TIMEOUT: 5000,
-            PROMPT_CHANGE_TIMEOUT: 15000
         },
         PROMPTS: {
             FULL: `That concludes the above topic. Please remember the chat history and switch roles:
@@ -129,6 +136,7 @@
         topWindow: unsafeWindow?.top || window
     };
     const settingsOrigin = getSettingsOrigin();
+    const SCRIPT_VERSION = "0.3.2";
 
     const state = {
         compressionInProgress: false,
@@ -136,7 +144,13 @@
         compressionResponsePending: false,
         lastPromptHistory: null,
         lastPromptHistoryUpdatedAt: 0,
-        pendingInjectedHistory: null,
+        lastResolvedPromptThread: null,
+        lastResolvedPromptRoot: null,
+        lastResolvedPromptId: null,
+        lastResolvedPromptUpdatedAt: 0,
+        googleApiKey: "",
+        googleApiKeyUpdatedAt: 0,
+        pendingBranchTurns: null,
         historyCapturePending: false,
         branchInProgress: false,
         activeCompressionPrompt: "",
@@ -448,27 +462,17 @@
         const originalFetch = ctx.fetch.bind(ctx);
 
         ctx.fetch = async function interceptFetch(input, init = {}) {
-            let request = input instanceof Request ? input : new Request(input, init);
-            const rewritten = await maybeRewriteCreatePromptRequest(request);
-            if (rewritten) {
-                request = rewritten;
-                init = undefined;
-            }
+            const request = input instanceof Request ? input : new Request(input, init);
+            const shouldLogGenerate = isTargetRequest(request.url, "GENERATE");
+            const shouldCaptureResolve = isTargetRequest(request.url, "RESOLVE");
 
-            const injectedResponse = maybeServeInjectedResponse(request.url);
-            if (injectedResponse) {
-                return injectedResponse;
-            }
-
-            const shouldIntercept = isTargetRequest(request.url, "GENERATE");
-
-            if (shouldIntercept) {
+            if (shouldLogGenerate) {
                 await logRequestPayload(request);
             }
 
-            const response = await originalFetch(request, cloneInit(init));
+            const response = await originalFetch(request);
 
-            if (shouldIntercept) {
+            if (shouldLogGenerate || shouldCaptureResolve) {
                 await logResponsePayload(request.url, response.clone());
             }
 
@@ -489,8 +493,10 @@
         try {
             const clonedRequest = request.clone();
             const bodyText = await clonedRequest.text();
+            const headers = Object.fromEntries(clonedRequest.headers.entries());
+            rememberGoogleApiKey(headers, clonedRequest.url);
             console.groupCollapsed(`${Config.TAGS.NET} request -> ${clonedRequest.url}`);
-            console.log("Headers:", Object.fromEntries(clonedRequest.headers.entries()));
+            console.log("Headers:", headers);
             try {
                 console.log("Parsed payload:", JSON.parse(bodyText));
             } catch {
@@ -499,7 +505,7 @@
             console.groupEnd();
             emitNetworkEvent(Config.EVENTS.REQUEST, {
                 url: clonedRequest.url,
-                headers: Object.fromEntries(clonedRequest.headers.entries()),
+                headers,
                 bodyText
             });
         } catch (err) {
@@ -510,11 +516,15 @@
     async function logResponsePayload(url, response) {
         try {
             const bodyText = await response.text();
+            const parsed = safeParseJSON(bodyText);
+            maybeCaptureResolvedPromptThread(url, bodyText, parsed);
             console.groupCollapsed(`${Config.TAGS.NET} response <- ${url}`);
             console.log("Status:", response.status, response.statusText);
-            try {
-                console.log("Parsed response:", JSON.parse(bodyText));
-            } catch {
+            if (isTargetRequest(url, "RESOLVE")) {
+                console.log("Resolve response summary:", describeResolvedPromptCapture(extractResolvedPromptThread(parsed)));
+            } else if (parsed) {
+                console.log("Parsed response:", parsed);
+            } else {
                 console.log("Raw response:", bodyText);
             }
             console.groupEnd();
@@ -540,50 +550,39 @@
 
         function WrappedXHR() {
             const realXHR = new OriginalXHR();
-            let intercepted = false;
+            let monitored = false;
             let requestUrl = null;
+            const requestHeaders = {};
 
             const originalOpen = realXHR.open;
             realXHR.open = function (...args) {
                 const [, url] = args;
                 requestUrl = url || null;
-                if (url && isTargetRequest(url)) {
-                    intercepted = true;
-                    log.net("GenerateContent XHR detected in", label, url);
+                monitored = Boolean(url) && (isTargetRequest(url, "GENERATE") || isTargetRequest(url, "RESOLVE"));
+                if (monitored) {
+                    log.net("Monitored XHR detected in", label, url);
                 }
                 return originalOpen.apply(this, args);
             };
 
+            const originalSetRequestHeader = realXHR.setRequestHeader;
+            realXHR.setRequestHeader = function (name, value) {
+                if (typeof name === "string") {
+                    requestHeaders[name] = value;
+                    rememberGoogleApiKey(requestHeaders, resolveUrl(requestUrl));
+                }
+                return originalSetRequestHeader.apply(this, arguments);
+            };
+
             const originalSend = realXHR.send;
             realXHR.send = function (body) {
-                if (state.pendingInjectedHistory && requestUrl && isTargetRequest(requestUrl, "CREATE_PROMPT") && body) {
-                    const rewritten = rewriteCreatePromptBodyString(body);
-                    if (rewritten) {
-                        body = rewritten;
-                        arguments[0] = rewritten;
-                    }
-                }
-
-                const injected = maybeServeInjectedResponse(requestUrl);
-                if (injected) {
-                    log.net("Serve injected response via XHR", { url: requestUrl, label });
-                    Promise.resolve(injected.text()).then(payload => {
-                        Object.defineProperty(realXHR, "responseText", { value: payload });
-                        Object.defineProperty(realXHR, "response", { value: payload });
-                        Object.defineProperty(realXHR, "readyState", { value: 4 });
-                        Object.defineProperty(realXHR, "status", { value: 200 });
-                        Object.defineProperty(realXHR, "statusText", { value: "OK" });
-                        Object.defineProperty(realXHR, "responseURL", { value: requestUrl });
-                        realXHR.dispatchEvent(new Event("readystatechange"));
-                        realXHR.dispatchEvent(new Event("load"));
-                    });
-                    return;
-                }
-
-                if (intercepted) {
+                if (monitored) {
                     const absoluteUrl = resolveUrl(requestUrl);
                     const bodyText = bodyToText(body);
+                    const headers = Object.keys(requestHeaders).length ? { ...requestHeaders } : null;
+                    rememberGoogleApiKey(headers, absoluteUrl);
                     console.groupCollapsed(`${Config.TAGS.NET} XHR request -> ${absoluteUrl}`);
+                    console.log("Headers:", headers);
                     if (bodyText) {
                         try {
                             console.log("Parsed payload:", JSON.parse(bodyText));
@@ -596,7 +595,7 @@
                     console.groupEnd();
                     emitNetworkEvent(Config.EVENTS.REQUEST, {
                         url: absoluteUrl,
-                        headers: null,
+                        headers,
                         bodyText
                     });
                 }
@@ -604,22 +603,28 @@
             };
 
             realXHR.addEventListener("readystatechange", function () {
-                if (intercepted && realXHR.readyState === 4) {
-                    console.groupCollapsed(`${Config.TAGS.NET} XHR response <- ${realXHR.responseURL}`);
-                    console.log("Status:", realXHR.status, realXHR.statusText);
-                    try {
-                        console.log("Parsed response:", JSON.parse(realXHR.responseText));
-                    } catch {
-                        console.log("Raw response:", realXHR.responseText);
-                    }
-                    console.groupEnd();
-                    emitNetworkEvent(Config.EVENTS.RESPONSE, {
-                        url: realXHR.responseURL,
-                        status: realXHR.status,
-                        statusText: realXHR.statusText,
-                        bodyText: realXHR.responseText
-                    });
+                if (realXHR.readyState !== 4 || !monitored) {
+                    return;
                 }
+                const responseUrl = realXHR.responseURL || resolveUrl(requestUrl);
+                const parsed = safeParseJSON(realXHR.responseText);
+                maybeCaptureResolvedPromptThread(responseUrl, realXHR.responseText, parsed);
+                console.groupCollapsed(`${Config.TAGS.NET} XHR response <- ${responseUrl}`);
+                console.log("Status:", realXHR.status, realXHR.statusText);
+                if (isTargetRequest(responseUrl, "RESOLVE")) {
+                    console.log("Resolve response summary:", describeResolvedPromptCapture(extractResolvedPromptThread(parsed)));
+                } else if (parsed) {
+                    console.log("Parsed response:", parsed);
+                } else {
+                    console.log("Raw response:", realXHR.responseText);
+                }
+                console.groupEnd();
+                emitNetworkEvent(Config.EVENTS.RESPONSE, {
+                    url: responseUrl,
+                    status: realXHR.status,
+                    statusText: realXHR.statusText,
+                    bodyText: realXHR.responseText
+                });
             });
 
             return realXHR;
@@ -636,7 +641,7 @@
         }
     }
 
-    function cloneInit(init) {
+    function resolveUrl(init) {
         if (!init || typeof init !== "object") return undefined;
         return {
             body: cloneBody(init.body),
@@ -662,48 +667,6 @@
         } catch {
             return url;
         }
-    }
-
-    function maybeServeInjectedResponse(url) {
-        const pending = state.pendingInjectedHistory;
-        if (!pending || !url) return null;
-
-        if (isTargetRequest(url, "RESOLVE") && pending.resolveBody && !pending.resolveServed) {
-            log.net("Serve injected history via ResolveDriveResource");
-            return finalizeInjectedResponse(pending, "resolve");
-        }
-        if (isTargetRequest(url, "LIST_PROMPTS") && pending.listBody && !pending.listServed) {
-            log.net("Serve injected metadata via ListPrompts");
-            return finalizeInjectedResponse(pending, "list");
-        }
-        return null;
-    }
-
-    function finalizeInjectedResponse(pending, type) {
-        const response = createResponse(type === "resolve" ? pending.resolveBody : pending.listBody);
-        if (type === "resolve") pending.resolveServed = true;
-        if (type === "list") pending.listServed = true;
-        if (pending.resolveServed && pending.listServed) {
-            log.net("Injected history fulfilled for new chat");
-            state.pendingInjectedHistory = null;
-        }
-        return response;
-    }
-
-    function createResponse(body) {
-        return new Response(body, {
-            status: 200,
-            headers: { "Content-Type": "application/json+protobuf; charset=UTF-8" }
-        });
-    }
-
-    function cloneBody(body) {
-        if (!body) return null;
-        if (body instanceof ReadableStream) return body;
-        if (body instanceof Blob) return body.slice();
-        if (ArrayBuffer.isView(body)) return body.slice();
-        if (body instanceof ArrayBuffer) return body.slice(0);
-        return body;
     }
 
     function bodyToText(body) {
@@ -763,14 +726,20 @@
             textarea.dispatchEvent(new InputEvent("input", { bubbles: true, data: prompt, inputType: "insertText" }));
             textarea.dispatchEvent(new Event("change", { bubbles: true }));
             enableSendButton();
-            sendCompressionRequest(textarea);
-            log.ui("Compression request sent");
+            sendCompressionRequest(textarea).then(sent => {
+                if (sent) {
+                    log.ui("Compression request sent");
+                    return;
+                }
+                log.ui("Failed to trigger compression request; aborting this run");
+                Compression.finalizeRun();
+            });
         },
 
         prepareRunContext() {
             state.lastPromptHistory = null;
             state.lastPromptHistoryUpdatedAt = 0;
-            state.pendingInjectedHistory = null;
+            state.pendingBranchTurns = null;
             state.historyCapturePending = true;
             state.compressionRequestPending = false;
             state.compressionResponsePending = false;
@@ -838,7 +807,9 @@
                 return;
             }
             log.net("Compression snapshot extracted, rebuilding conversation");
-            rebuildConversation(snapshot);
+            rebuildConversation(snapshot).catch(err => {
+                log.net("Failed to rebuild conversation", err);
+            });
             Compression.finalizeRun();
         },
 
@@ -878,7 +849,84 @@
         }
     }
 
-    function sendCompressionRequest(textarea) {
+    function delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function nextFrame() {
+        return new Promise(resolve => requestAnimationFrame(() => resolve()));
+    }
+
+    async function waitForCompressionRequestCapture(timeoutMs = 1800) {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+            if (!state.compressionInProgress) {
+                return false;
+            }
+            if (state.compressionResponsePending || !state.compressionRequestPending) {
+                return true;
+            }
+            await delay(50);
+        }
+        return state.compressionResponsePending || !state.compressionRequestPending;
+    }
+
+    function dispatchPointerClickSequence(el) {
+        if (!el || typeof el.dispatchEvent !== "function") return false;
+        const doc = el.ownerDocument || document;
+        const view = doc.defaultView || window;
+        const rect = typeof el.getBoundingClientRect === "function"
+            ? el.getBoundingClientRect()
+            : { left: 0, top: 0, width: 0, height: 0 };
+        const centerX = rect.left + (rect.width || 0) / 2;
+        const centerY = rect.top + (rect.height || 0) / 2;
+        const eventSteps = [
+            { type: "pointerdown", pointer: true, buttons: 1, detail: 0 },
+            { type: "mousedown", buttons: 1, detail: 1 },
+            { type: "pointerup", pointer: true, buttons: 0, detail: 0 },
+            { type: "mouseup", buttons: 0, detail: 1 },
+            { type: "click", buttons: 0, detail: 1 }
+        ];
+
+        try {
+            if (typeof el.focus === "function") {
+                el.focus({ preventScroll: true });
+            }
+        } catch {
+            if (typeof el.focus === "function") {
+                el.focus();
+            }
+        }
+
+        for (const step of eventSteps) {
+            const init = {
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                view,
+                clientX: centerX,
+                clientY: centerY,
+                button: 0,
+                buttons: step.buttons,
+                detail: step.detail
+            };
+            let event;
+            if (step.pointer && typeof view.PointerEvent === "function") {
+                event = new view.PointerEvent(step.type, {
+                    ...init,
+                    pointerId: 1,
+                    pointerType: "mouse",
+                    isPrimary: true
+                });
+            } else {
+                event = new view.MouseEvent(step.type, init);
+            }
+            el.dispatchEvent(event);
+        }
+        return true;
+    }
+
+    function triggerKeyboardSend(textarea) {
         const doc = textarea.ownerDocument || document;
         const view = doc.defaultView || window;
         const keyOptions = {
@@ -896,10 +944,58 @@
         }
         textarea.dispatchEvent(new view.KeyboardEvent("keydown", keyOptions));
         textarea.dispatchEvent(new view.KeyboardEvent("keyup", keyOptions));
-        requestAnimationFrame(() => {
-            setTextareaValue(textarea, "");
-            textarea.dispatchEvent(new InputEvent("input", { bubbles: true, data: "", inputType: "deleteContentBackward" }));
-            textarea.dispatchEvent(new Event("change", { bubbles: true }));
+        log.ui("Prompt send attempted via keyboard shortcut fallback");
+    }
+
+    async function sendPromptWithRetries(textarea, options = {}) {
+        const clickPlan = [
+            { label: "immediate", delayMs: 0, useFrame: false },
+            { label: "next-frame", delayMs: 0, useFrame: true },
+            { label: "delay-80ms", delayMs: 80, useFrame: false },
+            { label: "delay-220ms", delayMs: 220, useFrame: false }
+        ];
+        const verifyFn = typeof options.verifyFn === "function" ? options.verifyFn : null;
+        const labelPrefix = options.labelPrefix || "Prompt send";
+        const abortCheck = typeof options.abortCheck === "function" ? options.abortCheck : null;
+
+        for (const step of clickPlan) {
+            if (step.useFrame) {
+                await nextFrame();
+            } else if (step.delayMs > 0) {
+                await delay(step.delayMs);
+            }
+            if (abortCheck && abortCheck()) {
+                return false;
+            }
+
+            enableSendButton();
+            const sendButton = UI.findSendButton();
+            if (!sendButton) {
+                log.ui("Send button missing before click attempt", `${labelPrefix} ${step.label}`);
+                continue;
+            }
+
+            dispatchPointerClickSequence(sendButton);
+            log.ui(`${labelPrefix} click attempted`, step.label);
+            if (!verifyFn || await verifyFn()) {
+                log.ui(`${labelPrefix} confirmed`, step.label);
+                return true;
+            }
+        }
+
+        triggerKeyboardSend(textarea);
+        if (!verifyFn || await verifyFn()) {
+            log.ui(`${labelPrefix} confirmed via keyboard fallback`);
+            return true;
+        }
+        return false;
+    }
+
+    async function sendCompressionRequest(textarea) {
+        return sendPromptWithRetries(textarea, {
+            labelPrefix: "Compression request",
+            verifyFn: () => waitForCompressionRequestCapture(),
+            abortCheck: () => !state.compressionInProgress
         });
     }
 
@@ -918,30 +1014,22 @@
     }
 
     // ---------------------------
-    // Conversation rebuild & injection
+    // Conversation rebuild & branch creation
     // ---------------------------
 
-    function rebuildConversation(snapshotText) {
+    async function rebuildConversation(snapshotText) {
         log.net("rebuildConversation invoked", {
             hasHistory: Boolean(state.lastPromptHistory),
+            hasResolvedThread: Boolean(state.lastResolvedPromptThread),
             snapshotLength: snapshotText?.length || 0
         });
 
-        if (!state.lastPromptHistory) {
-            log.net("No prompt history to rebuild");
-            return;
-        }
-
-        log.net("Rebuilding conversation using stored history", {
-            summary: describePromptHistory(state.lastPromptHistory)
-        });
-
-        const turns = extractTurns(state.lastPromptHistory);
+        const turns = await getRebuildSourceTurns();
         if (!turns.length) {
-            log.net("No turns extracted from prompt history");
+            log.net("No prompt history available to rebuild conversation");
             return;
         }
-        const sanitizedTurns = stripCompressionPromptTurn(turns);
+        const sanitizedTurns = stripCompressionArtifacts(turns);
         if (!sanitizedTurns.length) {
             log.net("History only contained compression prompt turn, abort rebuild");
             return;
@@ -952,10 +1040,10 @@
             createTurn("model", "Got it. Thanks for the additional context!"),
             ...preserved
         ];
-        state.pendingInjectedHistory = buildInjectedPayload(newTurns);
-        log.net("Prepared injected history with", newTurns.length, "turns");
+        state.pendingBranchTurns = newTurns;
+        log.net("Prepared compressed branch turns", newTurns.length, "turns");
         Branching.branchFromHere().catch(err => {
-            log.net("Branch injection failed", err);
+            log.net("Compressed branch creation failed", err);
         });
     }
 
@@ -1055,6 +1143,331 @@
         }
     }
 
+    async function getRebuildSourceTurns() {
+        const currentPromptId = Branching.getCurrentPromptId();
+        if (state.lastResolvedPromptThread?.length) {
+            if (!currentPromptId || !state.lastResolvedPromptId || state.lastResolvedPromptId === currentPromptId) {
+                const resolvedTurns = extractResolvedTurns(state.lastResolvedPromptThread);
+                if (resolvedTurns.length) {
+                    log.net("Rebuilding conversation from resolved prompt thread", {
+                        promptId: state.lastResolvedPromptId,
+                        turnCount: resolvedTurns.length,
+                        updatedAt: state.lastResolvedPromptUpdatedAt
+                    });
+                    return resolvedTurns;
+                }
+            } else {
+                log.net("Resolved prompt thread does not match current prompt, skipping", {
+                    currentPromptId,
+                    resolvedPromptId: state.lastResolvedPromptId
+                });
+            }
+        }
+
+        const fetchedCapture = await ensureResolvedPromptThread(currentPromptId);
+        if (fetchedCapture?.entries?.length) {
+            const fetchedTurns = extractResolvedTurns(fetchedCapture.entries);
+            if (fetchedTurns.length) {
+                log.net("Rebuilding conversation from on-demand resolved prompt thread", {
+                    promptId: fetchedCapture.promptId,
+                    turnCount: fetchedTurns.length
+                });
+                return fetchedTurns;
+            }
+        }
+
+        if (!state.lastPromptHistory) {
+            return [];
+        }
+
+        log.net("Rebuilding conversation using stored GenerateContent history", {
+            summary: describePromptHistory(state.lastPromptHistory)
+        });
+        return extractTurns(state.lastPromptHistory);
+    }
+
+    async function ensureResolvedPromptThread(promptId) {
+        if (!promptId) {
+            return null;
+        }
+        if (state.lastResolvedPromptThread?.length && (!state.lastResolvedPromptId || state.lastResolvedPromptId === promptId)) {
+            return {
+                promptId: state.lastResolvedPromptId || promptId,
+                title: getResolvedPromptTitle(state.lastResolvedPromptRoot),
+                root: state.lastResolvedPromptRoot ? deepClone(state.lastResolvedPromptRoot) : null,
+                entries: state.lastResolvedPromptThread.map(entry => deepClone(entry))
+            };
+        }
+        return fetchResolvedPromptThread(promptId);
+    }
+
+    async function fetchResolvedPromptThread(promptId) {
+        const authHeader = await buildSapisidAuthHeader();
+        if (!authHeader) {
+            log.net("Unable to build SAPISIDHASH auth header for ResolveDriveResource fetch");
+            return null;
+        }
+        const endpoint = `${Config.NETWORK.RPC_ORIGIN}${Config.TARGETS.RESOLVE}`;
+        const apiKey = getGoogleApiKey();
+        try {
+            const response = await fetch(endpoint, {
+                method: "POST",
+                credentials: "include",
+                headers: {
+                    "content-type": "application/json+protobuf",
+                    "x-goog-api-key": apiKey,
+                    "x-goog-authuser": "0",
+                    authorization: authHeader
+                },
+                body: JSON.stringify([promptId])
+            });
+            const bodyText = await response.text();
+            if (!response.ok) {
+                log.net("ResolveDriveResource fetch failed", {
+                    promptId,
+                    status: response.status,
+                    bodyText
+                });
+                return null;
+            }
+            const capture = extractResolvedPromptThread(safeParseJSON(bodyText));
+            if (!capture?.entries?.length) {
+                log.net("ResolveDriveResource fetch returned no reusable thread", { promptId });
+                return null;
+            }
+            rememberResolvedPromptCapture(capture, "Fetched resolved prompt thread on demand");
+            return capture;
+        } catch (err) {
+            log.net("ResolveDriveResource fetch threw", err);
+            return null;
+        }
+    }
+
+    function getCookieValue(name) {
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const match = document.cookie.match(new RegExp(`(?:^|; )${escaped}=([^;]*)`));
+        return match ? decodeURIComponent(match[1]) : "";
+    }
+
+    function getHeaderValue(headers, name) {
+        if (!headers || typeof headers !== "object" || !name) {
+            return "";
+        }
+        const normalizedName = String(name).toLowerCase();
+        for (const [key, value] of Object.entries(headers)) {
+            if (String(key).toLowerCase() === normalizedName && typeof value === "string") {
+                return value;
+            }
+        }
+        return "";
+    }
+
+    function rememberGoogleApiKey(headers, sourceUrl = "") {
+        const candidate = getHeaderValue(headers, "x-goog-api-key").trim();
+        if (!candidate) {
+            return "";
+        }
+        if (candidate !== state.googleApiKey) {
+            log.net("Captured Google API key from native request headers", {
+                sourceUrl,
+                length: candidate.length
+            });
+        }
+        state.googleApiKey = candidate;
+        state.googleApiKeyUpdatedAt = Date.now();
+        return candidate;
+    }
+
+    function getGoogleApiKey() {
+        const apiKey = (state.googleApiKey || "").trim();
+        if (!apiKey) {
+            throw new Error("Google API key has not been captured yet; trigger one native AI Studio request first");
+        }
+        return apiKey;
+    }
+
+    async function buildSapisidAuthHeader() {
+        const sapisid = getCookieValue("SAPISID") || getCookieValue("__Secure-3PAPISID") || getCookieValue("APISID");
+        if (!sapisid || !globalThis.crypto?.subtle) {
+            return null;
+        }
+        const timestamp = Math.floor(Date.now() / 1000);
+        const origin = location.origin;
+        const encoder = new TextEncoder();
+        const source = `${timestamp} ${sapisid} ${origin}`;
+        const digest = await globalThis.crypto.subtle.digest("SHA-1", encoder.encode(source));
+        const hash = Array.from(new Uint8Array(digest))
+            .map(byte => byte.toString(16).padStart(2, "0"))
+            .join("");
+        return `SAPISIDHASH ${timestamp}_${hash} SAPISID1PHASH ${timestamp}_${hash} SAPISID3PHASH ${timestamp}_${hash}`;
+    }
+
+    function extractResolvedTurns(entries) {
+        if (!Array.isArray(entries)) {
+            return [];
+        }
+        const turns = [];
+        for (const entry of entries) {
+            if (!Array.isArray(entry) || entry.length < 9) continue;
+            const role = entry[8];
+            const text = extractResolvedEntryText(entry);
+            if (typeof role === "string" && text) {
+                turns.push({
+                    role,
+                    text,
+                    entry: deepClone(entry)
+                });
+            }
+        }
+        log.net("Extracted", turns.length, "turns from resolved prompt thread");
+        return turns;
+    }
+
+    function extractResolvedEntryText(entry) {
+        if (!Array.isArray(entry)) return "";
+        if (typeof entry[0] === "string" && entry[0]) {
+            return entry[0];
+        }
+        const parts = Array.isArray(entry[29]) ? entry[29] : null;
+        if (!parts) {
+            return "";
+        }
+        let buffer = "";
+        for (const part of parts) {
+            if (!Array.isArray(part)) continue;
+            const chunk = part[1];
+            if (typeof chunk === "string") {
+                buffer += chunk;
+            }
+        }
+        return buffer;
+    }
+
+    function rememberResolvedPromptCapture(capture, label = "Captured resolved prompt thread") {
+        if (!capture?.entries?.length) {
+            return;
+        }
+        state.lastResolvedPromptThread = capture.entries.map(entry => deepClone(entry));
+        state.lastResolvedPromptRoot = Array.isArray(capture.root) ? deepClone(capture.root) : null;
+        state.lastResolvedPromptId = capture.promptId;
+        state.lastResolvedPromptUpdatedAt = Date.now();
+        log.net(label, describeResolvedPromptCapture(capture));
+    }
+
+    function maybeCaptureResolvedPromptThread(url, bodyText, parsed = null) {
+        if (!isTargetRequest(url, "RESOLVE") || typeof bodyText !== "string") {
+            return;
+        }
+        const payload = parsed || safeParseJSON(bodyText);
+        const capture = extractResolvedPromptThread(payload);
+        if (!capture?.entries?.length) {
+            return;
+        }
+        rememberResolvedPromptCapture(capture);
+    }
+
+    function collectPromptIds(value, matches = [], seen = new Set()) {
+        if (value == null) {
+            return matches;
+        }
+        if (typeof value === "string") {
+            const match = value.match(/(?:^|\b)prompts\/([^/?#\s"']+)/);
+            if (match && !matches.includes(match[1])) {
+                matches.push(match[1]);
+            }
+            return matches;
+        }
+        if (typeof value !== "object") {
+            return matches;
+        }
+        if (seen.has(value)) {
+            return matches;
+        }
+        seen.add(value);
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                collectPromptIds(item, matches, seen);
+            }
+            return matches;
+        }
+        for (const nested of Object.values(value)) {
+            collectPromptIds(nested, matches, seen);
+        }
+        return matches;
+    }
+
+    function extractResolvedPromptThread(payload) {
+        if (!Array.isArray(payload) || !Array.isArray(payload[0])) {
+            return null;
+        }
+        const root = payload[0];
+        if (!Array.isArray(root) || root.length < 14) {
+            return null;
+        }
+        const threads = Array.isArray(root[13]) ? root[13] : null;
+        const primaryThread = Array.isArray(threads?.[0]) ? threads[0] : null;
+        if (!primaryThread?.length) {
+            return null;
+        }
+        return {
+            promptId: extractMutationPromptId(root),
+            title: getResolvedPromptTitle(root),
+            root: deepClone(root),
+            entries: primaryThread.filter(Array.isArray).map(entry => deepClone(entry))
+        };
+    }
+
+    function describeResolvedPromptCapture(capture) {
+        if (!capture) {
+            return { valid: false };
+        }
+        return {
+            valid: true,
+            promptId: capture.promptId,
+            title: capture.title || "",
+            turnCount: capture.entries?.length || 0,
+            firstRole: capture.entries?.[0]?.[8]
+        };
+    }
+
+
+    function getResolvedPromptTitle(root) {
+        const candidate = Array.isArray(root?.[4]) ? root[4][0] : null;
+        if (typeof candidate === "string" && candidate.trim()) {
+            return candidate.trim();
+        }
+        const heading = document.querySelector("main h1")?.textContent || document.querySelector("h1")?.textContent || "";
+        return heading.trim();
+    }
+
+    function buildDirectBranchCreateBody(capture, turnRecords = null) {
+        const sourceRoot = Array.isArray(capture?.root) ? capture.root : state.lastResolvedPromptRoot;
+        if (!Array.isArray(sourceRoot) || sourceRoot.length < 14) {
+            return null;
+        }
+        const modelConfig = Array.isArray(sourceRoot[3]) ? deepClone(sourceRoot[3]) : null;
+        if (!modelConfig) {
+            return null;
+        }
+        const threads = Array.isArray(sourceRoot[13]) ? sourceRoot[13] : [];
+        const secondaryThread = Array.isArray(threads[1]) ? deepClone(threads[1]) : [];
+        const primaryThread = Array.isArray(turnRecords) && turnRecords.length
+            ? turnRecords.map((turn, index) => buildMutationThreadEntry(turn, index))
+            : (Array.isArray(threads[0]) ? deepClone(threads[0]) : []);
+        if (!primaryThread.length) {
+            return null;
+        }
+        const baseTitle = getResolvedPromptTitle(sourceRoot) || "Compressed Chat";
+        const normalizedTitle = baseTitle.replace(/^branch of\s+/i, "").trim() || baseTitle;
+        const branchTitle = `Compression of ${normalizedTitle}`;
+        const createRoot = new Array(Math.max(14, sourceRoot.length)).fill(null);
+        createRoot[3] = modelConfig;
+        createRoot[4] = [branchTitle];
+        createRoot[12] = Array.isArray(sourceRoot[12]) ? deepClone(sourceRoot[12]) : [];
+        createRoot[13] = [primaryThread, secondaryThread];
+        return JSON.stringify([createRoot]);
+    }
+
     function describePromptHistory(payload) {
         if (!Array.isArray(payload)) {
             return { valid: false, type: typeof payload };
@@ -1072,15 +1485,74 @@
         };
     }
 
-    function stripCompressionPromptTurn(turns) {
+    function stripCompressionArtifacts(turns) {
         if (!turns.length) return turns;
-        const lastTurn = turns[turns.length - 1];
-        const snippet = state.activeCompressionSnippet || deriveSnippet(getCompressPrompt());
-        if (lastTurn?.role === "user" && typeof lastTurn.text === "string" && snippet && lastTurn.text.includes(snippet)) {
-            log.net("Detected compression prompt turn at tail, removing from preserved history");
-            return turns.slice(0, -1);
+        const sanitized = turns.slice();
+        let removed = 0;
+        let removedSnapshotTurn = false;
+
+        while (sanitized.length) {
+            const lastTurn = sanitized[sanitized.length - 1];
+            if (isCompressionPromptTurn(lastTurn)) {
+                sanitized.pop();
+                removed += 1;
+                removedSnapshotTurn = false;
+                continue;
+            }
+            if (isCompressionSnapshotTurn(lastTurn)) {
+                sanitized.pop();
+                removed += 1;
+                removedSnapshotTurn = true;
+                continue;
+            }
+            if (removedSnapshotTurn && isThoughtOnlyTurn(lastTurn)) {
+                sanitized.pop();
+                removed += 1;
+                continue;
+            }
+            break;
         }
-        return turns;
+
+        if (removed > 0) {
+            log.net("Removed compression artifact turns from tail", {
+                removed,
+                remaining: sanitized.length
+            });
+        }
+        return sanitized;
+    }
+
+    function isCompressionPromptTurn(turn) {
+        const snippet = state.activeCompressionSnippet || deriveSnippet(getCompressPrompt());
+        return Boolean(
+            turn?.role === "user" &&
+            typeof turn.text === "string" &&
+            snippet &&
+            turn.text.includes(snippet)
+        );
+    }
+
+    function isCompressionSnapshotTurn(turn) {
+        if (turn?.role !== "model" || typeof turn.text !== "string" || !turn.text) {
+            return false;
+        }
+        if (/<state_snapshot>[\s\S]*<\/state_snapshot>/i.test(turn.text)) {
+            return true;
+        }
+        const pattern = getSnapshotRegex();
+        if (pattern && matchByRegex(turn.text, pattern)) {
+            return true;
+        }
+        return /<scratchpad>/i.test(turn.text) && /state[_ -]?snapshot/i.test(turn.text);
+    }
+
+    function isThoughtOnlyTurn(turn) {
+        return Boolean(
+            turn?.role === "model" &&
+            Array.isArray(turn.entry) &&
+            turn.entry.length >= 33 &&
+            turn.entry[19] === 1
+        );
     }
 
     function extractTurnText(rawContent, role) {
@@ -1144,32 +1616,7 @@
     }
 
     function createTurn(role, text) {
-        return {
-            role,
-            text,
-            entry: buildCreatePromptEntry({ role, text })
-        };
-    }
-
-    function buildInjectedPayload(turnRecords) {
-        const history = turnRecords.map(turn => [
-            [
-                [
-                    null,
-                    turn.text
-                ]
-            ],
-            turn.role
-        ]);
-        const promptHistory = JSON.stringify(history);
-        const metadata = JSON.stringify([[turnRecords[0]?.text?.slice(0, 50) || "Compressed Chat", 0]]);
-        return {
-            resolveBody: promptHistory,
-            listBody: metadata,
-            resolveServed: false,
-            listServed: false,
-            turns: turnRecords
-        };
+        return { role, text };
     }
 
     // ---------------------------
@@ -1179,104 +1626,91 @@
     const Branching = {
         async branchFromHere() {
             if (state.branchInProgress) {
-                log.ui("Branch injection already running, please wait");
+                log.ui("Compression branch already running");
                 return;
             }
-            log.net("Attempting to branch from current turn");
-            const menuBtn = await Branching.waitForBranchMenuTrigger();
-            if (!menuBtn) {
-                log.net("Branch menu trigger not found after waiting");
-                alert("无法定位 Branch 菜单，请确保已打开某个对话。");
-                return;
-            }
-            log.net("Branch menu trigger located, opening menu");
-            const previousPromptId = Branching.getCurrentPromptId();
+            log.net("Attempting to create compressed prompt");
             state.branchInProgress = true;
             try {
-                menuBtn.click();
-                log.ui("Turn menu clicked for branch");
-                const branchItem = await Branching.waitForBranchMenuItem();
-                log.net("Branch menu item located, clicking");
-                branchItem.click();
-                log.ui("Branch from here clicked, waiting for new prompt to load");
-                try {
-                    await Branching.waitForPromptChange(previousPromptId);
-                    log.ui("New prompt detected after branching");
-                    log.net("Branch completed successfully");
-                } catch (err) {
-                    log.net("Prompt ID did not change after branch", err);
-                }
+                const promptChange = await Branching.branchFromHereViaCreatePrompt();
+                log.ui("Compression prompt created, navigating");
+                log.net("Direct CreatePrompt compression completed", promptChange);
+                location.assign(`${location.origin}/prompts/${promptChange.promptId}`);
             } catch (err) {
-                log.net("Branch injection failed", err);
-                state.pendingInjectedHistory = null;
+                log.net("Compressed branch creation failed", err);
+                state.pendingBranchTurns = null;
                 throw err;
             } finally {
                 state.branchInProgress = false;
             }
         },
 
-        waitForBranchMenuTrigger(timeout = Config.TIMING.BRANCH_MENU_TIMEOUT) {
-            return waitForCondition(() => Branching.findBranchMenuTrigger(), timeout, "branch menu trigger");
+        async branchFromHereViaCreatePrompt() {
+            const previousPromptId = Branching.getCurrentPromptId();
+            if (!previousPromptId) {
+                throw new Error("current prompt id not found");
+            }
+            if (!state.pendingBranchTurns?.length) {
+                throw new Error("no pending turns available for branch creation");
+            }
+            const capture = await ensureResolvedPromptThread(previousPromptId);
+            const body = buildDirectBranchCreateBody(capture, state.pendingBranchTurns);
+            if (!body) {
+                throw new Error("unable to build CreatePrompt branch payload");
+            }
+            const authHeader = await buildSapisidAuthHeader();
+            if (!authHeader) {
+                throw new Error("unable to build SAPISIDHASH auth header");
+            }
+
+            const pendingBranchTurns = state.pendingBranchTurns;
+            const apiKey = getGoogleApiKey();
+            state.pendingBranchTurns = null;
+            try {
+                const response = await fetch(`${Config.NETWORK.RPC_ORIGIN}${Config.TARGETS.CREATE_PROMPT}`, {
+                    method: "POST",
+                    credentials: "include",
+                    headers: {
+                        "content-type": "application/json+protobuf",
+                        "x-goog-api-key": apiKey,
+                        "x-goog-authuser": "0",
+                        authorization: authHeader
+                    },
+                    body
+                });
+                const bodyText = await response.text();
+                if (!response.ok) {
+                    throw new Error(`CreatePrompt failed: ${response.status} ${bodyText.slice(0, 300)}`);
+                }
+                const parsed = safeParseJSON(bodyText);
+                const promptId = Branching.pickCreatedPromptId(parsed, previousPromptId);
+                if (!promptId) {
+                    throw new Error("CreatePrompt succeeded but no prompt id was returned");
+                }
+                return {
+                    promptId,
+                    via: "direct-create-prompt"
+                };
+            } catch (err) {
+                state.pendingBranchTurns = pendingBranchTurns;
+                throw err;
+            }
         },
 
-        waitForBranchMenuItem(timeout = Config.TIMING.BRANCH_MENU_TIMEOUT) {
-            return waitForCondition(() => {
-                const buttons = document.querySelectorAll('button[role="menuitem"], button.mat-mdc-menu-item');
-                for (const btn of buttons) {
-                    if (btn.textContent && btn.textContent.includes("Branch from here")) {
-                        log.net("Found Branch from here menu item");
-                        return btn;
-                    }
-                }
-                return null;
-            }, timeout, "Branch menu item");
-        },
-
-        waitForPromptChange(previousPromptId, timeout = Config.TIMING.PROMPT_CHANGE_TIMEOUT) {
-            return waitForCondition(() => {
-                const current = Branching.getCurrentPromptId();
-                if (current && current !== previousPromptId) {
-                    return current;
-                }
-                return null;
-            }, timeout, "prompt ID change");
+        pickCreatedPromptId(payload, previousPromptId = null) {
+            const topLevelPrompt = typeof payload?.[0] === "string" ? payload[0] : "";
+            const topLevelMatch = topLevelPrompt.match(/^prompts\/([^/?#]+)/);
+            if (topLevelMatch && (!previousPromptId || topLevelMatch[1] !== previousPromptId)) {
+                return topLevelMatch[1];
+            }
+            const promptIds = collectPromptIds(payload);
+            return promptIds.find(id => id && id !== previousPromptId) || null;
         },
 
         getCurrentPromptId() {
             const path = location.pathname || "";
             const match = path.match(/\/prompts\/([^/?#]+)/);
             return match ? match[1] : null;
-        },
-
-        findBranchMenuTrigger() {
-            const selectors = [
-                'button[aria-label="More actions"]',
-                'button[aria-label="More options"]',
-                'button[aria-haspopup="menu"]',
-                'button.mat-mdc-menu-trigger'
-            ];
-            for (const doc of UI.getCandidateDocuments()) {
-                const turns = doc.querySelectorAll("ms-chat-turn");
-                if (!turns.length) continue;
-                const candidates = [];
-                if (turns.length > 1) {
-                    candidates.push(turns[turns.length - 2]);
-                }
-                candidates.push(turns[turns.length - 1]);
-                for (const turn of candidates) {
-                    for (const selector of selectors) {
-                        const btn = turn.querySelector(selector);
-                        if (btn) {
-                            log.net("Branch menu trigger found on turn", {
-                                turnIndex: Array.prototype.indexOf.call(turns, turn),
-                                totalTurns: turns.length
-                            });
-                            return btn;
-                        }
-                    }
-                }
-            }
-            return null;
         }
     };
 
@@ -1330,12 +1764,22 @@
             if (!window.location.href.includes(Config.UI.TARGET_PATH)) return;
             for (const doc of UI.getCandidateDocuments()) {
                 if (doc.getElementById(Config.UI.BUTTON_ID)) return;
-                const toolbar = doc.querySelector(Config.UI.TOOLBAR_SELECTOR);
+                const toolbar = UI.findToolbar(doc);
                 if (!toolbar) continue;
                 const button = UI.createButton(doc);
-                const moreButton = toolbar.querySelector('button[iconname="more_vert"]');
+                const moreButton = toolbar.querySelector(
+                    'button[iconname="more_vert"], button[aria-label="View more actions"], button[aria-label="More actions"], button[aria-label="More options"]'
+                );
+                let referenceNode = null;
                 if (moreButton) {
-                    toolbar.insertBefore(button, moreButton);
+                    if (moreButton.parentElement === toolbar) {
+                        referenceNode = moreButton;
+                    } else if (moreButton.parentElement && moreButton.parentElement.parentElement === toolbar) {
+                        referenceNode = moreButton.parentElement;
+                    }
+                }
+                if (referenceNode) {
+                    toolbar.insertBefore(button, referenceNode);
                     log.ui("Compressor button inserted before menu button");
                 } else {
                     toolbar.appendChild(button);
@@ -1344,6 +1788,30 @@
                 return;
             }
             log.ui("Toolbar not found, wait for next mutation");
+        },
+        findToolbar(doc) {
+            const selectors = Array.isArray(Config.UI.TOOLBAR_SELECTORS)
+                ? Config.UI.TOOLBAR_SELECTORS
+                : [Config.UI.TOOLBAR_SELECTORS || Config.UI.TOOLBAR_SELECTOR].filter(Boolean);
+            for (const selector of selectors) {
+                const nodes = Array.from(doc.querySelectorAll(selector));
+                for (const node of nodes) {
+                    if (UI.isToolbarCandidate(node)) return node;
+                }
+            }
+            return null;
+        },
+        isToolbarCandidate(node) {
+            if (!node || typeof node.querySelector !== "function") return false;
+            const hasMenuButton = node.querySelector(
+                'button[iconname="more_vert"], button[aria-label="View more actions"], button[aria-label="More actions"], button[aria-label="More options"]'
+            );
+            if (hasMenuButton) return true;
+            const hasRunSettings = node.querySelector('button[aria-label="Toggle run settings panel"]');
+            if (hasRunSettings) return true;
+            const hasNewChat = node.querySelector('button[aria-label="New chat"]');
+            if (hasNewChat) return true;
+            return false;
         },
 
         createButton(doc = document) {
@@ -1483,76 +1951,52 @@
     };
 
     // ---------------------------
-    // CreatePrompt rewriting
+    // Prompt thread builders
     // ---------------------------
 
-    async function maybeRewriteCreatePromptRequest(request) {
-        if (!state.pendingInjectedHistory || !isTargetRequest(request.url, "CREATE_PROMPT")) {
-            return null;
-        }
-        try {
-            const bodyText = await request.clone().text();
-            const rewritten = rewriteCreatePromptBodyString(bodyText);
-            if (!rewritten) {
-                return null;
+    function extractMutationPromptId(root) {
+        const resourceName = typeof root?.[0] === "string" ? root[0] : "";
+        const match = resourceName.match(/prompts\/([^/?#]+)/);
+        return match ? match[1] : null;
+    }
+
+    function buildMutationThreadEntry(turn, sequence = 0) {
+        if (isReusablePromptThreadEntry(turn?.entry)) {
+            const entry = deepClone(turn.entry);
+            entry[0] = turn?.text || "";
+            entry[8] = turn?.role === "model" ? "model" : "user";
+            if (Array.isArray(entry[21]) && typeof entry[21][0] === "string" && /^prompts\//.test(entry[21][0])) {
+                entry[21] = null;
             }
-            log.net("CreatePrompt payload rewritten via fetch", {
-                turnCount: state.pendingInjectedHistory?.turns?.length || 0
-            });
-            return new Request(request, { body: rewritten });
-        } catch (err) {
-            log.net("Failed to rewrite CreatePrompt via fetch", err);
-            return null;
+            entry[32] = buildEntryTimestamp(sequence);
+            return entry;
         }
+        return buildCreatePromptEntry(turn, sequence);
     }
 
-    function rewriteCreatePromptBodyString(body) {
-        if (!state.pendingInjectedHistory?.turns) return null;
-        if (typeof body !== "string") return null;
-        let parsed;
-        try {
-            parsed = JSON.parse(body);
-        } catch {
-            return null;
-        }
-        if (!Array.isArray(parsed) || !Array.isArray(parsed[0])) {
-            return null;
-        }
-        const root = parsed[0];
-        if (!Array.isArray(root) || root.length < 14) {
-            return null;
-        }
-        const threads = Array.isArray(root[13]) ? root[13] : null;
-        if (!threads || !threads.length) {
-            return null;
-        }
-        const secondaryThread = threads[1] ? threads[1] : [];
-        const rebuiltThread = state.pendingInjectedHistory.turns.map(turn => buildCreatePromptEntry(turn));
-        root[13] = [rebuiltThread, secondaryThread];
-        log.net("CreatePrompt payload rewritten", {
-            turnCount: state.pendingInjectedHistory.turns.length
-        });
-        state.pendingInjectedHistory = null;
-        return JSON.stringify(parsed);
+    function isReusablePromptThreadEntry(entry) {
+        return Array.isArray(entry) && entry.length >= 33 && typeof entry[8] === "string";
     }
 
-    function buildCreatePromptEntry(turn) {
+    function buildCreatePromptEntry(turn, sequence = 0) {
         const text = turn?.text || "";
         const role = turn?.role === "model" ? "model" : "user";
-        const entry = new Array(9).fill(null);
+        const entry = new Array(33).fill(null);
         entry[0] = text;
         entry[8] = role;
         const tokenEstimate = estimateTokenCount(text);
         if (tokenEstimate > 0) {
-            while (entry.length < 19) {
-                entry.push(null);
-            }
             entry[18] = tokenEstimate;
         }
-        while (entry.length && (entry[entry.length - 1] === null || entry[entry.length - 1] === undefined)) {
-            entry.pop();
-        }
+        entry[32] = buildEntryTimestamp(sequence);
         return entry;
+    }
+
+    function buildEntryTimestamp(sequence = 0) {
+        const timestampMs = Date.now() + Math.max(0, Number(sequence) || 0);
+        const seconds = Math.floor(timestampMs / 1000);
+        const nanos = (timestampMs % 1000) * 1_000_000;
+        return [seconds, nanos];
     }
 
     function estimateTokenCount(text) {
@@ -1606,30 +2050,15 @@
         }
     }
 
-    function waitForCondition(checkFn, timeout, label) {
-        return new Promise((resolve, reject) => {
-            const start = Date.now();
-            const timer = setInterval(() => {
-                try {
-                    const result = checkFn();
-                    if (result) {
-                        clearInterval(timer);
-                        resolve(result);
-                        return;
-                    }
-                    if (Date.now() - start >= timeout) {
-                        clearInterval(timer);
-                        reject(new Error(`Timeout waiting for ${label || "condition"}`));
-                    }
-                } catch (err) {
-                    clearInterval(timer);
-                    reject(err);
-                }
-            }, 150);
-        });
-    }
-
     function bootstrap() {
+        const runtimeInfo = {
+            version: SCRIPT_VERSION,
+            href: location.href,
+            loadedAt: new Date().toISOString()
+        };
+        env.topWindow.__AISTUDIO_COMPRESSOR_RUNTIME__ = runtimeInfo;
+        console.info(Config.TAGS.UI, "Script version", runtimeInfo.version, "loaded", runtimeInfo);
+
         installTopLevelHandlers();
         registerMenuCommands();
         installSettingsMessageBridge();
